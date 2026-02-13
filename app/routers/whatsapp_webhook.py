@@ -3,12 +3,17 @@ WhatsApp Cloud API Webhook receiver.
 - GET  /api/webhook/whatsapp  → verification handshake
 - POST /api/webhook/whatsapp  → incoming message handler
 
+Supports:
+- Text messages → intent router → AI fallback
+- Audio/voice messages → Groq Whisper → intent router → AI fallback
+
 Flow:
-1. Check conversation state (follow-up to pending question?)
-2. Match intent via fuzzy keyword matching
-3. Check invoice commands
-4. Filter greetings / short messages
-5. AI fallback with strict formatting
+1. If audio → download → transcribe via Groq Whisper
+2. Check conversation state (follow-up to pending question?)
+3. Match intent via fuzzy keyword matching
+4. Check invoice command patterns
+5. Filter greetings / short messages
+6. AI fallback with per-user cooldown + language-aware tone
 """
 import os
 import time
@@ -19,6 +24,8 @@ from app.whatsapp_commands import match_intent, handle_command, HELP_REPLY
 from app.whatsapp_invoice_commands import is_invoice_command, handle_invoice_command
 from app.ai_advisor_service import generate_business_advice
 from app.whatsapp_state import resolve_follow_up, set_session, clear_session
+from app.whatsapp_media_service import download_whatsapp_media
+from app.whisper_service import transcribe_audio_bytes, detect_language
 from app.ai_config import USER_AI_COOLDOWN_SECONDS
 from app.database import SessionLocal
 
@@ -48,7 +55,22 @@ GREETING_REPLY = (
     ". production - Production report\n"
     ". top products - Best sellers\n"
     ". send last invoice - Invoice bhejo\n\n"
-    "Ya kuch bhi pucho business ke baare me!"
+    "Ya kuch bhi pucho business ke baare me!\n"
+    "Voice message bhi bhej sakte ho!"
+)
+
+# ── Audio error replies ──
+AUDIO_TOO_LARGE = (
+    "Audio thoda bada hai boss.\n"
+    "1 minute ke andar ka bhejo."
+)
+AUDIO_NO_KEY = (
+    "Voice message abhi setup nahi hua.\n"
+    "Text me bhejo boss."
+)
+AUDIO_FAILED = (
+    "Audio samajh nahi aaya boss.\n"
+    "Dobara bhejo ya text me likho."
 )
 
 
@@ -73,13 +95,7 @@ def verify_webhook(
 @router.post("/whatsapp")
 async def receive_webhook(request: Request):
     """
-    Handle incoming WhatsApp messages with strict priority routing:
-
-    1. Conversation state follow-up (pending question answer)
-    2. Deterministic intent match (fuzzy keywords)
-    3. Invoice command patterns
-    4. Greeting / too short → help menu
-    5. AI fallback with per-user cooldown
+    Handle incoming WhatsApp messages (text + audio).
     """
     body = await request.json()
 
@@ -90,13 +106,22 @@ async def receive_webhook(request: Request):
                 messages = value.get("messages", [])
 
                 for msg in messages:
-                    if msg.get("type") != "text":
+                    sender = msg["from"]
+                    msg_type = msg.get("type", "")
+                    msg_id = msg.get("id", "")
+
+                    # ── Audio message ────────────────────────────────
+                    if msg_type == "audio":
+                        reply = await _handle_audio(msg, sender)
+                        await send_whatsapp_text(to_number=sender, message=reply)
                         continue
 
-                    sender = msg["from"]
+                    # ── Text message ─────────────────────────────────
+                    if msg_type != "text":
+                        continue
+
                     text = msg["text"]["body"]
                     cmd = text.strip().lower()
-                    msg_id = msg.get("id", "")
 
                     logger.info(
                         f"[WhatsApp] From: {sender} | Msg: {text} | ID: {msg_id}"
@@ -104,7 +129,8 @@ async def receive_webhook(request: Request):
 
                     db = SessionLocal()
                     try:
-                        reply = await _route_message(sender, text, cmd, db)
+                        lang = detect_language(text)
+                        reply = await _route_message(sender, text, cmd, db, lang)
                     except Exception as e:
                         logger.error(f"Message routing error: {e}")
                         reply = "Thoda problem hua boss. Dobara try karo."
@@ -119,7 +145,63 @@ async def receive_webhook(request: Request):
     return {"status": "ok"}
 
 
-async def _route_message(sender: str, text: str, cmd: str, db) -> str:
+# ── Audio Handler ────────────────────────────────────────────────────
+async def _handle_audio(msg: dict, sender: str) -> str:
+    """
+    Process voice/audio message:
+    1. Download media from Meta
+    2. Transcribe via Groq Whisper
+    3. Route through intent router
+    4. AI fallback if no match
+    """
+    audio_info = msg.get("audio", {})
+    media_id = audio_info.get("id")
+
+    if not media_id:
+        logger.error("Audio message has no media_id")
+        return AUDIO_FAILED
+
+    logger.info(f"[Audio] From: {sender} | Media ID: {media_id}")
+
+    # Step 1: Download media
+    audio_bytes = await download_whatsapp_media(media_id)
+    if not audio_bytes:
+        return AUDIO_FAILED
+
+    # Step 2: Transcribe
+    text, lang = await transcribe_audio_bytes(audio_bytes)
+
+    # Audio bytes not stored — deleted after transcription (GC handles it)
+
+    # Handle error states
+    if text == "__TOO_LARGE__":
+        return AUDIO_TOO_LARGE
+    if text == "__NO_KEY__":
+        return AUDIO_NO_KEY
+    if text in ("__FAILED__", "__EMPTY__"):
+        return AUDIO_FAILED
+
+    logger.info(f"[Audio Transcribed] lang={lang} | Text: {text}")
+
+    # Step 3: Route through normal flow
+    cmd = text.strip().lower()
+
+    db = SessionLocal()
+    try:
+        reply = await _route_message(sender, text, cmd, db, lang)
+    except Exception as e:
+        logger.error(f"Audio routing error: {e}")
+        reply = "Thoda problem hua boss. Dobara try karo."
+    finally:
+        db.close()
+
+    return reply
+
+
+# ── Central Routing ──────────────────────────────────────────────────
+async def _route_message(
+    sender: str, text: str, cmd: str, db, language: str = "hindi"
+) -> str:
     """
     Central routing logic with strict priority:
     State → Intent → Invoice → Greeting → AI Fallback
@@ -160,7 +242,9 @@ async def _route_message(sender: str, text: str, cmd: str, db) -> str:
         return f"Thoda ruko boss, {wait} second baad pucho."
 
     _user_cooldowns[sender] = now
-    logger.info("AI fallback triggered")
+    logger.info(f"AI fallback triggered (lang={language})")
 
-    reply = await generate_business_advice(DEMO_COMPANY_ID, text, db)
+    reply = await generate_business_advice(
+        DEMO_COMPANY_ID, text, db, language=language
+    )
     return reply
