@@ -1,16 +1,25 @@
 """
 WhatsApp Cloud API Webhook receiver.
 - GET  /api/webhook/whatsapp  → verification handshake
-- POST /api/webhook/whatsapp  → incoming message handler with command engine + AI fallback
+- POST /api/webhook/whatsapp  → incoming message handler
+
+Flow:
+1. Check conversation state (follow-up to pending question?)
+2. Match intent via fuzzy keyword matching
+3. Check invoice commands
+4. Filter greetings / short messages
+5. AI fallback with strict formatting
 """
 import os
 import time
 import logging
 from fastapi import APIRouter, Query, Request, HTTPException
 from app.whatsapp_service import send_whatsapp_text
-from app.whatsapp_commands import handle_command, COMMANDS
+from app.whatsapp_commands import match_intent, handle_command, HELP_REPLY
 from app.whatsapp_invoice_commands import is_invoice_command, handle_invoice_command
 from app.ai_advisor_service import generate_business_advice
+from app.whatsapp_state import resolve_follow_up, set_session, clear_session
+from app.ai_config import USER_AI_COOLDOWN_SECONDS
 from app.database import SessionLocal
 
 logger = logging.getLogger("whatsapp_webhook")
@@ -20,22 +29,26 @@ router = APIRouter(prefix="/api/webhook", tags=["WhatsApp Webhook"])
 # ── Hardcoded for demo — replace with phone→company lookup later ──
 DEMO_COMPANY_ID = "93f43afe-5844-4c2a-9f16-eaf07e0543d5"
 
-# ── Per-user cooldown: 30 seconds between AI calls ──
+# ── Per-user cooldown for AI calls ──
 _user_cooldowns: dict[str, float] = {}
-USER_COOLDOWN_SECONDS = 30
 
-# ── Greetings / short messages that skip AI ──
-SKIP_MESSAGES = {"hi", "hello", "hey", "ok", "okay", "yes", "no", "thanks", "thank you", "bye", "hm", "hmm", "ya", "haan", "nahi"}
+# ── Greetings / short messages that show help menu ──
+SKIP_MESSAGES = {
+    "hi", "hello", "hey", "ok", "okay", "yes", "no",
+    "thanks", "thank you", "bye", "hm", "hmm", "ya",
+    "haan", "nahi", "theek", "acha", "accha", "sahi",
+}
 
 GREETING_REPLY = (
-    "👋 Hello! I'm your Business Assistant.\n\n"
-    "Try these commands:\n"
-    "• *revenue* — Last 30 days revenue\n"
-    "• *profit* — Profit summary\n"
-    "• *low stock* — Stock alerts\n"
-    "• *send last invoice* — Send latest invoice\n"
-    "• *send invoice to <name>* — Send to customer\n\n"
-    "Or ask me anything about your business!"
+    "Hello boss! Main tumhara Business Assistant hu.\n\n"
+    "Ye try karo:\n"
+    ". revenue - Last 30 din ka revenue\n"
+    ". profit - Profit summary\n"
+    ". low stock - Stock alerts\n"
+    ". production - Production report\n"
+    ". top products - Best sellers\n"
+    ". send last invoice - Invoice bhejo\n\n"
+    "Ya kuch bhi pucho business ke baare me!"
 )
 
 
@@ -60,12 +73,13 @@ def verify_webhook(
 @router.post("/whatsapp")
 async def receive_webhook(request: Request):
     """
-    Handle incoming WhatsApp messages.
-    1. Check known commands (revenue, profit, low stock)
-    2. Check invoice commands (send last invoice, send to <name>, copy)
-    3. Filter greetings and short messages
-    4. Enforce per-user cooldown
-    5. Fallback to AI Business Advisor
+    Handle incoming WhatsApp messages with strict priority routing:
+
+    1. Conversation state follow-up (pending question answer)
+    2. Deterministic intent match (fuzzy keywords)
+    3. Invoice command patterns
+    4. Greeting / too short → help menu
+    5. AI fallback with per-user cooldown
     """
     body = await request.json()
 
@@ -90,36 +104,10 @@ async def receive_webhook(request: Request):
 
                     db = SessionLocal()
                     try:
-                        if cmd in COMMANDS:
-                            # ── Known data command ──
-                            reply = handle_command(text, DEMO_COMPANY_ID, db)
-
-                        elif is_invoice_command(text):
-                            # ── Invoice command (send, copy) ──
-                            reply = await handle_invoice_command(
-                                text, sender, DEMO_COMPANY_ID, db
-                            )
-
-                        elif cmd in SKIP_MESSAGES or len(cmd) <= 5:
-                            # ── Greeting or too short ──
-                            reply = GREETING_REPLY
-
-                        else:
-                            # ── AI fallback with per-user cooldown ──
-                            now = time.time()
-                            last_call = _user_cooldowns.get(sender, 0)
-
-                            if now - last_call < USER_COOLDOWN_SECONDS:
-                                wait = int(USER_COOLDOWN_SECONDS - (now - last_call))
-                                reply = f"⏳ Please wait {wait} seconds before asking again."
-                            else:
-                                _user_cooldowns[sender] = now
-                                reply = await generate_business_advice(
-                                    DEMO_COMPANY_ID, text, db
-                                )
+                        reply = await _route_message(sender, text, cmd, db)
                     except Exception as e:
-                        logger.error(f"Command/AI error: {e}")
-                        reply = "⚠️ Something went wrong. Please try again."
+                        logger.error(f"Message routing error: {e}")
+                        reply = "Thoda problem hua boss. Dobara try karo."
                     finally:
                         db.close()
 
@@ -130,3 +118,49 @@ async def receive_webhook(request: Request):
 
     return {"status": "ok"}
 
+
+async def _route_message(sender: str, text: str, cmd: str, db) -> str:
+    """
+    Central routing logic with strict priority:
+    State → Intent → Invoice → Greeting → AI Fallback
+    """
+
+    # ── 1. Check conversation state (follow-up answer?) ──────────────
+    follow_up = resolve_follow_up(sender, text)
+    if follow_up:
+        intent, value = follow_up
+        logger.info(f"Follow-up resolved: {intent} → {value}")
+        return handle_command(text, DEMO_COMPANY_ID, db, intent=intent)
+
+    # ── 2. Deterministic intent match ────────────────────────────────
+    intent = match_intent(text)
+    if intent:
+        logger.info(f"Intent matched: {intent}")
+        result = handle_command(text, DEMO_COMPANY_ID, db, intent=intent)
+        if result is not None:
+            return result
+
+    # ── 3. Invoice command patterns ──────────────────────────────────
+    if is_invoice_command(text):
+        logger.info("Invoice command detected")
+        return await handle_invoice_command(
+            text, sender, DEMO_COMPANY_ID, db
+        )
+
+    # ── 4. Greeting or too short → help menu ─────────────────────────
+    if cmd in SKIP_MESSAGES or len(cmd) <= 3:
+        return GREETING_REPLY
+
+    # ── 5. AI fallback with per-user cooldown ────────────────────────
+    now = time.time()
+    last_call = _user_cooldowns.get(sender, 0)
+
+    if now - last_call < USER_AI_COOLDOWN_SECONDS:
+        wait = int(USER_AI_COOLDOWN_SECONDS - (now - last_call))
+        return f"Thoda ruko boss, {wait} second baad pucho."
+
+    _user_cooldowns[sender] = now
+    logger.info("AI fallback triggered")
+
+    reply = await generate_business_advice(DEMO_COMPANY_ID, text, db)
+    return reply
